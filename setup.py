@@ -34,6 +34,7 @@ if __name__ == '__main__':
             'numpy >= 1.17.0',
             'pandas >= 0.25.0, != 0.25.0',
             'bokeh >= 3.0.0, != 3.0.*, != 3.2.*',
+            'pydantic >= 2.7.0',
         ],
         extras_require={
             'doc': [
@@ -54,6 +55,11 @@ if __name__ == '__main__':
                 'flake8',
                 'coverage',
                 'mypy',
+            ],
+            'trading': [
+                'streamlit >= 1.40.0',
+                'hyperliquid-python-sdk >= 0.14.0',
+                'eth-account >= 0.13.0',
             ],
         },
         test_suite="backtesting.test",
