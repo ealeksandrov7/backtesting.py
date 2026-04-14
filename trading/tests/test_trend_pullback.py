@@ -20,6 +20,13 @@ class TrendPullbackStrategyTest(unittest.TestCase):
             higher_tf_validation=False,
             allow_long=True,
             allow_short=True,
+            require_vwap_confirmation=False,
+            rsi_trend_threshold=50.0,
+            rsi_long_pullback_floor=0.0,
+            rsi_long_pullback_ceiling=100.0,
+            rsi_short_pullback_floor=0.0,
+            rsi_short_pullback_ceiling=100.0,
+            rsi_turn_threshold=0.0,
         )
 
     def test_long_signal_generation(self):
@@ -31,9 +38,9 @@ class TrendPullbackStrategyTest(unittest.TestCase):
                 {"Open": 102.0, "High": 104.0, "Low": 101.0, "Close": 103.0},
                 {"Open": 103.0, "High": 105.0, "Low": 102.0, "Close": 104.0},
                 {"Open": 104.0, "High": 106.0, "Low": 103.0, "Close": 105.0},
-                {"Open": 105.0, "High": 107.0, "Low": 104.0, "Close": 106.0},
+                {"Open": 105.0, "High": 108.0, "Low": 104.0, "Close": 106.0},
                 {"Open": 106.0, "High": 107.0, "Low": 104.0, "Close": 105.0},
-                {"Open": 105.0, "High": 107.0, "Low": 104.0, "Close": 106.0},
+                {"Open": 105.0, "High": 109.0, "Low": 104.0, "Close": 106.0},
             ],
             index=pd.date_range("2025-01-01", periods=9, freq="15min", tz="UTC"),
         )

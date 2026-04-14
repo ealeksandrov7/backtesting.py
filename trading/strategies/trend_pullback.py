@@ -11,12 +11,12 @@ from trading.models import StrategyDecision, TradeAction
 
 class TrendPullbackParams(BaseModel):
     ema_fast: int = Field(default=12, ge=2, le=200)
-    ema_trend: int = Field(default=40, ge=3, le=300)
-    ema_bias: int = Field(default=160, ge=5, le=500)
+    ema_trend: int = Field(default=30, ge=3, le=300)
+    ema_bias: int = Field(default=120, ge=5, le=500)
     atr_period: int = Field(default=14, ge=2, le=100)
-    atr_stop_multiplier: float = Field(default=1.0, gt=0.1, le=10.0)
-    reward_to_risk: float = Field(default=2.0, gt=0.1, le=10.0)
-    time_stop_bars: int = Field(default=12, ge=1, le=200)
+    atr_stop_multiplier: float = Field(default=1.2, gt=0.1, le=10.0)
+    reward_to_risk: float = Field(default=3.0, gt=0.1, le=10.0)
+    time_stop_bars: int = Field(default=20, ge=1, le=200)
     higher_tf_validation: bool = True
     allow_long: bool = True
     allow_short: bool = True
@@ -24,14 +24,22 @@ class TrendPullbackParams(BaseModel):
     higher_tf_4h_fast: int = Field(default=20, ge=2, le=200)
     higher_tf_4h_slow: int = Field(default=50, ge=3, le=300)
     higher_tf_adx_period: int = Field(default=14, ge=2, le=100)
-    higher_tf_adx_threshold: float = Field(default=15.0, ge=0.0, le=100.0)
-    macd_fast: int = Field(default=12, ge=2, le=100)
-    macd_slow: int = Field(default=26, ge=3, le=200)
-    macd_signal: int = Field(default=9, ge=2, le=100)
+    higher_tf_adx_threshold: float = Field(default=28.0, ge=0.0, le=100.0)
+    higher_tf_slope_bars: int = Field(default=3, ge=1, le=50)
+    rsi_period: int = Field(default=14, ge=2, le=100)
+    rsi_trend_threshold: float = Field(default=51.0, ge=0.0, le=100.0)
+    rsi_long_pullback_floor: float = Field(default=38.0, ge=0.0, le=100.0)
+    rsi_long_pullback_ceiling: float = Field(default=50.0, ge=0.0, le=100.0)
+    rsi_short_pullback_floor: float = Field(default=50.0, ge=0.0, le=100.0)
+    rsi_short_pullback_ceiling: float = Field(default=62.0, ge=0.0, le=100.0)
+    rsi_turn_threshold: float = Field(default=2.0, ge=0.0, le=50.0)
+    pullback_atr_buffer: float = Field(default=0.25, ge=0.0, le=5.0)
+    trigger_lookback: int = Field(default=1, ge=1, le=20)
     volume_window: int = Field(default=20, ge=2, le=200)
-    volume_ratio_threshold: float = Field(default=0.8, gt=0.0, le=10.0)
-    vwap_window: int = Field(default=20, ge=2, le=200)
-    trailing_stop_enabled: bool = True
+    volume_ratio_threshold: float = Field(default=1.0, gt=0.0, le=10.0)
+    require_volume_confirmation: bool = False
+    require_vwap_confirmation: bool = True
+    trailing_stop_enabled: bool = False
     trailing_stop_lookback: int = Field(default=10, ge=2, le=200)
     trailing_stop_atr_multiplier: float = Field(default=2.5, gt=0.1, le=20.0)
 
@@ -54,20 +62,32 @@ def _atr(frame: pd.DataFrame, period: int) -> pd.Series:
     return true_range.ewm(alpha=1 / period, adjust=False).mean()
 
 
-def _macd(series: pd.Series, fast: int, slow: int, signal: int) -> tuple[pd.Series, pd.Series, pd.Series]:
-    fast_ema = _ema(series, fast)
-    slow_ema = _ema(series, slow)
-    macd_line = fast_ema - slow_ema
-    signal_line = _ema(macd_line, signal)
-    histogram = macd_line - signal_line
-    return macd_line, signal_line, histogram
-
-
-def _rolling_vwap(frame: pd.DataFrame, window: int) -> pd.Series:
+def _session_vwap(frame: pd.DataFrame) -> pd.Series:
     typical_price = (frame["High"] + frame["Low"] + frame["Close"]) / 3.0
+    if not isinstance(frame.index, pd.DatetimeIndex):
+        cumulative_price_volume = (typical_price * frame["Volume"]).cumsum()
+        cumulative_volume = frame["Volume"].cumsum()
+        return cumulative_price_volume / cumulative_volume.replace(0, np.nan)
+
+    timestamps = frame.index.tz_convert("UTC") if frame.index.tz is not None else frame.index
+    sessions = pd.Series(timestamps.normalize(), index=frame.index)
     price_volume = typical_price * frame["Volume"]
-    rolling_volume = frame["Volume"].rolling(window, min_periods=1).sum()
-    return price_volume.rolling(window, min_periods=1).sum() / rolling_volume.replace(0, np.nan)
+    cumulative_price_volume = price_volume.groupby(sessions).cumsum()
+    cumulative_volume = frame["Volume"].groupby(sessions).cumsum()
+    return cumulative_price_volume / cumulative_volume.replace(0, np.nan)
+
+
+def _rsi(series: pd.Series, period: int) -> pd.Series:
+    delta = series.diff()
+    gains = delta.clip(lower=0.0)
+    losses = -delta.clip(upper=0.0)
+    average_gain = gains.ewm(alpha=1 / period, adjust=False).mean()
+    average_loss = losses.ewm(alpha=1 / period, adjust=False).mean()
+    relative_strength = average_gain / average_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + relative_strength))
+    rsi = rsi.where(average_loss != 0, 100.0)
+    rsi = rsi.where(average_gain != 0, 0.0)
+    return rsi
 
 
 def _dmi_adx(frame: pd.DataFrame, period: int) -> tuple[pd.Series, pd.Series, pd.Series]:
@@ -120,10 +140,8 @@ def compute_trend_pullback_frame(
     frame["ema_bias"] = _ema(frame["Close"], params.ema_bias)
     frame["atr"] = _atr(frame, params.atr_period)
     frame["volume_median"] = frame["Volume"].rolling(params.volume_window, min_periods=1).median()
-    frame["rolling_vwap"] = _rolling_vwap(frame, params.vwap_window)
-    frame["macd"], frame["macd_signal"], frame["macd_hist"] = _macd(
-        frame["Close"], params.macd_fast, params.macd_slow, params.macd_signal
-    )
+    frame["session_vwap"] = _session_vwap(frame)
+    frame["rsi"] = _rsi(frame["Close"], params.rsi_period)
     frame["trailing_high"] = frame["High"].rolling(params.trailing_stop_lookback, min_periods=1).max()
     frame["trailing_low"] = frame["Low"].rolling(params.trailing_stop_lookback, min_periods=1).min()
     frame["long_trailing_stop"] = (
@@ -146,6 +164,9 @@ def compute_trend_pullback_frame(
             frame["htf_4h_slow"] = _ema(frame_4h["Close"], params.higher_tf_4h_slow).reindex(
                 frame.index, method="ffill"
             )
+            frame["htf_4h_slow_shift"] = _ema(frame_4h["Close"], params.higher_tf_4h_slow).shift(
+                params.higher_tf_slope_bars
+            ).reindex(frame.index, method="ffill")
             frame["htf_4h_plus_di"] = plus_di_4h.reindex(frame.index, method="ffill")
             frame["htf_4h_minus_di"] = minus_di_4h.reindex(frame.index, method="ffill")
             frame["htf_4h_adx"] = adx_4h.reindex(frame.index, method="ffill")
@@ -154,12 +175,14 @@ def compute_trend_pullback_frame(
                 & (frame["htf_4h_fast"] > frame["htf_4h_slow"])
                 & (frame["htf_4h_plus_di"] > frame["htf_4h_minus_di"])
                 & (frame["htf_4h_adx"] >= params.higher_tf_adx_threshold)
+                & (frame["htf_4h_slow"] > frame["htf_4h_slow_shift"])
             ).fillna(False)
             short_htf_regime &= (
                 (frame["htf_4h_close"] < frame["htf_4h_fast"])
                 & (frame["htf_4h_fast"] < frame["htf_4h_slow"])
                 & (frame["htf_4h_minus_di"] > frame["htf_4h_plus_di"])
                 & (frame["htf_4h_adx"] >= params.higher_tf_adx_threshold)
+                & (frame["htf_4h_slow"] < frame["htf_4h_slow_shift"])
             ).fillna(False)
 
     long_regime = (
@@ -173,41 +196,62 @@ def compute_trend_pullback_frame(
         & short_htf_regime
     )
 
+    long_pullback_floor = pd.concat([frame["ema_trend"], frame["session_vwap"]], axis=1).min(axis=1)
+    long_pullback_ceiling = pd.concat([frame["ema_fast"], frame["session_vwap"]], axis=1).max(axis=1)
+    short_pullback_floor = pd.concat([frame["ema_fast"], frame["session_vwap"]], axis=1).min(axis=1)
+    short_pullback_ceiling = pd.concat([frame["ema_trend"], frame["session_vwap"]], axis=1).max(axis=1)
+    pullback_buffer = frame["atr"] * params.pullback_atr_buffer
+
     prev_long_pullback = (
-        (frame["Low"].shift(1) <= frame["ema_fast"].shift(1))
+        (frame["Low"].shift(1) <= (long_pullback_ceiling + pullback_buffer).shift(1))
         & (
             frame["Close"].shift(1).between(
-                frame[["ema_fast", "ema_trend"]].min(axis=1).shift(1),
-                frame[["ema_fast", "ema_trend"]].max(axis=1).shift(1),
+                (long_pullback_floor - pullback_buffer).shift(1),
+                (long_pullback_ceiling + pullback_buffer).shift(1),
             )
+        )
+        & frame["rsi"].shift(1).between(
+            params.rsi_long_pullback_floor,
+            params.rsi_long_pullback_ceiling,
         )
     )
     prev_short_pullback = (
-        (frame["High"].shift(1) >= frame["ema_fast"].shift(1))
+        (frame["High"].shift(1) >= (short_pullback_floor - pullback_buffer).shift(1))
         & (
             frame["Close"].shift(1).between(
-                frame[["ema_fast", "ema_trend"]].min(axis=1).shift(1),
-                frame[["ema_fast", "ema_trend"]].max(axis=1).shift(1),
+                (short_pullback_floor - pullback_buffer).shift(1),
+                (short_pullback_ceiling + pullback_buffer).shift(1),
             )
         )
+        & frame["rsi"].shift(1).between(
+            params.rsi_short_pullback_floor,
+            params.rsi_short_pullback_ceiling,
+        )
     )
+
+    trigger_high = frame["High"].rolling(params.trigger_lookback, min_periods=1).max().shift(1)
+    trigger_low = frame["Low"].rolling(params.trigger_lookback, min_periods=1).min().shift(1)
 
     bullish_confirmation = (
         (frame["Close"] > frame["Open"])
         & (frame["Close"] > frame["ema_fast"])
-        & (frame["Close"] > frame["rolling_vwap"])
-        & (frame["macd"] > frame["macd_signal"])
-        & (frame["macd_hist"] > frame["macd_hist"].shift(1))
-        & (frame["Volume"] >= frame["volume_median"] * params.volume_ratio_threshold)
+        & (frame["High"] > trigger_high)
+        & ((frame["rsi"] - frame["rsi"].shift(1)) >= params.rsi_turn_threshold)
+        & (frame["rsi"] >= params.rsi_trend_threshold)
     )
     bearish_confirmation = (
         (frame["Close"] < frame["Open"])
         & (frame["Close"] < frame["ema_fast"])
-        & (frame["Close"] < frame["rolling_vwap"])
-        & (frame["macd"] < frame["macd_signal"])
-        & (frame["macd_hist"] < frame["macd_hist"].shift(1))
-        & (frame["Volume"] >= frame["volume_median"] * params.volume_ratio_threshold)
+        & (frame["Low"] < trigger_low)
+        & ((frame["rsi"].shift(1) - frame["rsi"]) >= params.rsi_turn_threshold)
+        & (frame["rsi"] <= (100 - params.rsi_trend_threshold))
     )
+    if params.require_vwap_confirmation:
+        bullish_confirmation &= frame["Close"] > frame["session_vwap"]
+        bearish_confirmation &= frame["Close"] < frame["session_vwap"]
+    if params.require_volume_confirmation:
+        bullish_confirmation &= frame["Volume"] >= frame["volume_median"] * params.volume_ratio_threshold
+        bearish_confirmation &= frame["Volume"] >= frame["volume_median"] * params.volume_ratio_threshold
 
     frame["long_signal"] = (
         long_regime
@@ -297,7 +341,7 @@ def latest_trend_pullback_decision(
             confidence=0.6,
             thesis_summary="BTC long pullback aligned across 15m structure and higher-timeframe trend strength.",
             invalidation="Price loses the pullback swing low or ATR stop level.",
-            rationale="The 15m pullback reclaimed local trend structure with MACD and volume confirmation while the enabled higher-timeframe filters remained bullish.",
+            rationale="The 15m pullback reclaimed EMA and session VWAP with RSI turning back up while the enabled 4h trend-strength filters remained bullish.",
             time_stop_bars=params.time_stop_bars,
         )
     if row["signal"] == -1:
@@ -313,7 +357,7 @@ def latest_trend_pullback_decision(
             confidence=0.6,
             thesis_summary="BTC short pullback aligned across 15m structure and higher-timeframe trend strength.",
             invalidation="Price reclaims the pullback swing high or ATR stop level.",
-            rationale="The 15m pullback reclaimed local downside structure with MACD and volume confirmation while the enabled higher-timeframe filters remained bearish.",
+            rationale="The 15m pullback rejected EMA and session VWAP with RSI turning back down while the enabled 4h trend-strength filters remained bearish.",
             time_stop_bars=params.time_stop_bars,
         )
     return None
@@ -327,12 +371,12 @@ def build_trend_pullback_strategy_class():
 
     class TrendPullbackStrategy(Strategy):
         ema_fast = 12
-        ema_trend = 40
-        ema_bias = 160
+        ema_trend = 30
+        ema_bias = 120
         atr_period = 14
-        atr_stop_multiplier = 1.0
-        reward_to_risk = 2.0
-        time_stop_bars = 12
+        atr_stop_multiplier = 1.2
+        reward_to_risk = 3.0
+        time_stop_bars = 20
         higher_tf_validation = True
         allow_long = True
         allow_short = True
@@ -340,14 +384,22 @@ def build_trend_pullback_strategy_class():
         higher_tf_4h_fast = 20
         higher_tf_4h_slow = 50
         higher_tf_adx_period = 14
-        higher_tf_adx_threshold = 15.0
-        macd_fast = 12
-        macd_slow = 26
-        macd_signal = 9
+        higher_tf_adx_threshold = 28.0
+        higher_tf_slope_bars = 3
+        rsi_period = 14
+        rsi_trend_threshold = 51.0
+        rsi_long_pullback_floor = 38.0
+        rsi_long_pullback_ceiling = 50.0
+        rsi_short_pullback_floor = 50.0
+        rsi_short_pullback_ceiling = 62.0
+        rsi_turn_threshold = 2.0
+        pullback_atr_buffer = 0.25
+        trigger_lookback = 1
         volume_window = 20
-        volume_ratio_threshold = 0.8
-        vwap_window = 20
-        trailing_stop_enabled = True
+        volume_ratio_threshold = 1.0
+        require_volume_confirmation = False
+        require_vwap_confirmation = True
+        trailing_stop_enabled = False
         trailing_stop_lookback = 10
         trailing_stop_atr_multiplier = 2.5
 
@@ -377,12 +429,20 @@ def build_trend_pullback_strategy_class():
                 higher_tf_4h_slow=self.higher_tf_4h_slow,
                 higher_tf_adx_period=self.higher_tf_adx_period,
                 higher_tf_adx_threshold=self.higher_tf_adx_threshold,
-                macd_fast=self.macd_fast,
-                macd_slow=self.macd_slow,
-                macd_signal=self.macd_signal,
+                higher_tf_slope_bars=self.higher_tf_slope_bars,
+                rsi_period=self.rsi_period,
+                rsi_trend_threshold=self.rsi_trend_threshold,
+                rsi_long_pullback_floor=self.rsi_long_pullback_floor,
+                rsi_long_pullback_ceiling=self.rsi_long_pullback_ceiling,
+                rsi_short_pullback_floor=self.rsi_short_pullback_floor,
+                rsi_short_pullback_ceiling=self.rsi_short_pullback_ceiling,
+                rsi_turn_threshold=self.rsi_turn_threshold,
+                pullback_atr_buffer=self.pullback_atr_buffer,
+                trigger_lookback=self.trigger_lookback,
                 volume_window=self.volume_window,
                 volume_ratio_threshold=self.volume_ratio_threshold,
-                vwap_window=self.vwap_window,
+                require_volume_confirmation=self.require_volume_confirmation,
+                require_vwap_confirmation=self.require_vwap_confirmation,
                 trailing_stop_enabled=self.trailing_stop_enabled,
                 trailing_stop_lookback=self.trailing_stop_lookback,
                 trailing_stop_atr_multiplier=self.trailing_stop_atr_multiplier,

@@ -12,7 +12,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from trading.db import TradingRepository
-from trading.market_data import HyperliquidMarketDataClient
+from trading.market_data import create_market_data_client
 from trading.models import BacktestRequest
 from trading.services import BacktestService
 from trading.strategy_registry import build_default_registry
@@ -57,6 +57,11 @@ def main() -> None:
         with st.form("backtest-form"):
             symbol = st.selectbox("Market", definition.metadata.supported_markets)
             timeframe = st.selectbox("Timeframe", definition.metadata.supported_timeframes)
+            market_data_source = st.selectbox(
+                "Market Data Source",
+                options=["hyperliquid", "binance"],
+                format_func=lambda value: value.title(),
+            )
             start_time = st.text_input("Start Time (UTC ISO8601)", "2025-01-01T00:00:00+00:00")
             end_time = st.text_input("End Time (UTC ISO8601)", "2025-02-01T00:00:00+00:00")
             cash = st.number_input("Starting Cash", min_value=100.0, value=10000.0, step=100.0)
@@ -73,6 +78,12 @@ def main() -> None:
                         step=int(spec.step or 1),
                         help=spec.description,
                     )
+                elif spec.type == "boolean":
+                    params[spec.name] = st.checkbox(
+                        spec.label,
+                        value=bool(spec.default),
+                        help=spec.description,
+                    )
                 else:
                     params[spec.name] = st.number_input(
                         spec.label,
@@ -86,7 +97,7 @@ def main() -> None:
 
         if submitted:
             try:
-                market_data = HyperliquidMarketDataClient(testnet=False)
+                market_data = create_market_data_client(market_data_source)
                 service = BacktestService(
                     repository=repository,
                     registry=registry,
@@ -107,7 +118,7 @@ def main() -> None:
                     )
                 )
             except requests.RequestException as exc:
-                st.error(f"Failed to reach Hyperliquid market data: {exc}")
+                st.error(f"Failed to reach {market_data_source.title()} market data: {exc}")
             except Exception as exc:
                 st.error(str(exc))
             else:
